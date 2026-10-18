@@ -467,3 +467,7 @@ This project is released under the [MIT License](LICENSE.md).
 You are free to use, fork, modify, and redistribute it, provided that you retain the copyright notice and license text.
 
 Copyright (c) 2026 Albert Sayapov.
+
+## Support the development
+
+Feel free to support the development of this and future builds via [paypal](https://www.paypal.com/donate/?business=D7YMVYBKM8BZW&no_recurring=0&item_name=Support+the+development+github.com%2Fvidoq1&currency_code=USD)
