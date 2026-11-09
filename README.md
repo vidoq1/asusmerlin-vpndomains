@@ -5,6 +5,7 @@ A domain-based IPv4 routing add-on that lives inside the Asuswrt-Merlin admin in
 It uses the router's existing dnsmasq, ipset, firewall, policy routing, admin WebUI, and service hooks. It does not create a VPN connection, run a separate web server, or open another management port.
 
 > Status: installation, reinstallation, purge, WireGuard selection, domain routing, and WebUI operation have been tested on an ASUS ROG Rapture GT-AX11000 Pro running Asuswrt-Merlin 3006.102.9. Other models and firmware versions are untested. Boot recovery and compatibility with every third-party add-on are not established by these tests. See [Compatibility](#compatibility).
+> Version 3.0.3: the explicit backend upgrade, migration to a 21600-second ipset timeout, IPv4 insertion from a fresh DNS response, and restored website access were tested on the same router. Long-term behavior across DNS cache expiration, repeated timeout renewal, and failure-triggered rollback on real hardware still requires validation.
 
 ## Why this exists
 
@@ -28,6 +29,9 @@ DNS filtering stays separate. Adding a domain here does not whitelist it in Dive
 - Preserve an existing backend during ordinary WebUI repair.
 - Provide compatibility checks and a WireGuard-selection test without applying configuration changes.
 - Back up affected files outside the add-on directory before managed backend changes.
+- Provide an explicit `upgrade-backend` command that preserves the existing WireGuard binding and domain allowlist.
+- Use a 21600-second IPv4 set timeout with 3600-second limits on dnsmasq cache lifetime and client-facing DNS TTL.
+- Back up the destination ipset before managed backend transactions and attempt to restore its configuration and unexpired entries on rollback.
 - Package everything in one self-contained `vpn-domain-install.sh`. No external payload directory or additional repository files are required for installation.
 
 ## What it does not do
@@ -74,8 +78,22 @@ The main components are:
 4. `vpn-domain-routing.sh` checks tunnel readiness and manages the mark and policy-routing rule.
 5. `vpn-domain-refresh.sh` regenerates the DNS include, requests a DNS restart if its content has changed or is not recorded as loaded, and applies routing.
 
-The set uses IPv4 addresses with a 3600-second timeout. It is not a per-client database: once an address is in the set, matching traffic from any local client reaching the router's rule can use the selected route.
+The set uses IPv4 addresses with a default timeout of 21600 seconds (6 hours). It is not a per-client database: once an address is in the set, matching traffic from any local client reaching the router's rule can use the selected route.
 
+The generated dnsmasq include also sets:
+
+```ini
+max-cache-ttl=3600
+max-ttl=3600
+```
+
+`max-cache-ttl` limits how long dnsmasq retains cached DNS records. `max-ttl` limits the TTL sent to clients. These are upper limits; shorter upstream TTLs are not increased.
+
+These settings apply to all DNS records handled by the main dnsmasq instance that loads this include, not just domains in the VPN allowlist. They change DNS caching behavior, not DNS-filter rules.
+
+The longer ipset lifetime is intended to keep learned addresses available beyond the DNS cache lifetime. Version 3.0.3 does not add a handler that restores missing entries on every cached DNS response. A cache hit must not be assumed to repopulate a missing ipset entry.
+
+Newly learned addresses can coexist with older addresses until the older entries expire. Changing a domain's DNS address does not immediately remove its previously learned address from the set.
 ### DNS filtering comes first
 
 "DNS filtering comes first" describes the sequence of operations, not a special firewall priority or a bypass-proof access-control mechanism.
@@ -173,7 +191,7 @@ On the tested router, existing hook calls for installed plug-ins remained presen
 ### Prepare the WireGuard client
 
 ```text
-Free VPN client (WireGuard) can be obteined: PROTON VPN https://protonvpn.com/
+Configure an existing WireGuard client before installation. For example, you can use a compatible configuration from [Proton VPN](https://protonvpn.com/) or another provider.
 ```
 
 In the Merlin WebUI:
@@ -246,10 +264,10 @@ Click `Reload` to read the current router copy. Edit the list and click `Save an
 ## Commands and maintenance
 
 ```sh
-sh /jffs/addons/vpn-domain/vpn-domain-install.sh help
-sh /jffs/addons/vpn-domain/vpn-domain-install.sh status
-sh /jffs/addons/vpn-domain/vpn-domain-install.sh check
-sh /jffs/addons/vpn-domain/vpn-domain-install.sh test-menu
+sh /jffs/addons/vpn-domain/install.sh help
+sh /jffs/addons/vpn-domain/install.sh status
+sh /jffs/addons/vpn-domain/install.sh check
+sh /jffs/addons/vpn-domain/install.sh test-menu
 ```
 
 | Command | Behavior |
@@ -257,6 +275,7 @@ sh /jffs/addons/vpn-domain/vpn-domain-install.sh test-menu
 | No command | Show the main menu; no implicit installation |
 | `install` | Fresh install, or WebUI-only repair of an existing active backend |
 | `configure-vpn` | Explicit binding change, recognized legacy migration, or re-enable |
+| `upgrade-backend` | Explicitly upgrade a recognized active backend, preserving its VPN binding and allowlist; back up files and ipset state, migrate the timeout, and restart DNS after confirmation |
 | `check` | Check compatibility and recognized hook cleanup without applying configuration |
 | `test-menu` | Test WireGuard discovery and selection; do not save the selection |
 | `status` | Show installation, configured binding, and routing state |
@@ -269,9 +288,104 @@ Checks still use temporary staging files and installer locking. "No configuratio
 
 On an existing active installation, ordinary `install` restores only the WebUI source, support scripts, and its two marked WebUI hooks. It preserves backend scripts, the allowlist, the generated DNS include, and the VPN binding. This branch does not request a DNS restart or apply routing.
 
-A partial installation stops instead of being silently treated as fresh. A disabled installation also stops: use `configure-vpn` to explicitly re-enable it.
+Running a newer installer with `install` does not upgrade an existing backend. Use `upgrade-backend` for the explicit backend update introduced in version 3.0.3.
 
-Running a newer installer with `install` is therefore not a general backend upgrade. Backend changes require the explicit configuration/migration path, where supported. Replace the persistent installer copy yourself after adopting a new version.
+#### Upgrade an existing active installation to 3.0.3
+
+Do not uninstall or purge first. The upgrade preserves the existing domain allowlist and WireGuard binding.
+
+1. Obtain the updated `vpn-domain-install.sh` from this repository and copy it to the router. Run this command on your computer, using your router's admin username and address:
+
+   ```sh
+   scp vpn-domain-install.sh admin@router_ip:/tmp/vpn-domain-install.sh
+   ```
+
+2. Open an interactive SSH session:
+
+   ```sh
+   ssh admin@router_ip
+   ```
+
+3. Check compatibility:
+
+   ```sh
+   sh /tmp/vpn-domain-install.sh check
+   ```
+
+   `check` is a preliminary compatibility and hook-planning check. The upgrade command performs additional backend fingerprint checks and may refuse locally modified or unsupported backend files.
+
+4. Make sure the currently configured WireGuard client is ready, then run:
+
+   ```sh
+   sh /tmp/vpn-domain-install.sh upgrade-backend
+   ```
+
+   Review the displayed interface, routing table, and changes. Type `YES` to proceed.
+
+   The upgrade:
+
+   - keeps the existing domain allowlist and WireGuard binding;
+   - backs up affected files and the current destination ipset;
+   - installs the updated backend and recognized managed hook blocks;
+   - migrates the destination set to a 21600-second default timeout;
+   - preserves existing learned IPs and renews their lifetime to 6 hours;
+   - sets `max-cache-ttl=3600` and `max-ttl=3600`;
+   - restarts dnsmasq and reapplies domain routing;
+   - attempts rollback if a transaction step fails.
+
+   DNS service is briefly interrupted during the restart. Existing client-side DNS caches retain their previously received TTL until renewed.
+
+5. Verify the result:
+
+   ```sh
+   sh /tmp/vpn-domain-install.sh status
+
+   grep -n -E '^(max-cache-ttl|max-ttl)=' \
+       /jffs/configs/vpn-domain-routing.conf
+   ```
+
+   Expected results include:
+
+   - managed version `3.0.3`;
+   - the same WireGuard interface and routing table as before;
+   - `Tunnel: ready`;
+   - `timeout 21600` in the ipset header;
+   - both DNS settings set to `3600`.
+
+6. Test a listed domain through the router's DNS:
+
+   ```sh
+   nslookup example.com 127.0.0.1
+   ipset list vpn_domain_v4
+   ```
+
+   Replace `example.com` with a domain already in your allowlist. For a fresh external A-record response, check that the returned IPv4 address appears in the set. A cached answer alone does not prove that a missing entry will be restored.
+
+   Then test the website from the intended client.
+
+7. After successful verification, preserve the updated installer for future maintenance:
+
+   ```sh
+   cp -p /tmp/vpn-domain-install.sh \
+       /jffs/addons/vpn-domain/install.sh
+   ```
+
+   The installer does not automatically replace this saved copy.
+
+Backups are stored under:
+
+```text
+/jffs/vpn-domain-backups/<timestamp>-<pid>/
+```
+
+The upgrade prints the exact backup directory. Retain it until the updated installation has been verified.
+
+#### Installations requiring inspection or re-enable
+
+- A partial installation is not treated as fresh and requires inspection.
+- A disabled installation is not silently re-enabled by `install` or `upgrade-backend`; use the explicit `configure-vpn` workflow.
+- `upgrade-backend` refuses backend files that do not match its supported fingerprints. Do not bypass this check by creating marker files or removing unknown hook content.
+- `configure-vpn` is not a substitute for `upgrade-backend`: selecting the same active managed binding can return without updating any backend files.
 
 ### Changing the selected WireGuard client
 
@@ -348,9 +462,24 @@ Affected files are backed up under:
 /jffs/vpn-domain-backups/<timestamp>-<pid>/
 ```
 
-Backend-changing operations record missing files and the pre-change cron listing as well. Failures after the transaction begins trigger a best-effort file, cron, DNS, and routing rollback. This is not a complete snapshot of router state, and live WebUI state is not fully reconstructed by every rollback path.
+Managed backend transactions also record missing files and the pre-change cron listing.
 
-Backups are outside the add-on directory and survive `purge`. They are not automatically pruned. Copy important backups off the router; they can contain private configuration and cron details.
+Starting with version 3.0.3, these transactions save the destination ipset's configuration and entries when the set exists:
+
+```text
+ipset.before.save
+ipset.before.epoch
+```
+
+If the set does not exist, an absence marker is recorded instead.
+
+Failures after the transaction begins trigger a best-effort rollback of files, the health cron job, DNS integration, routing, and the destination ipset. When restoring saved entries, the rollback subtracts elapsed time from their saved remaining timeout and skips entries that have already expired. Permanent entries in the saved state remain permanent on rollback.
+
+This is not a complete router snapshot. Entries learned after the snapshot are not guaranteed to survive rollback, and live WebUI state is not fully reconstructed by every rollback path. Automatic rollback can itself fail; inspect the reported errors and retain the backup directory.
+
+The ipset migration and rollback logic were tested with an ipset simulation. Successful migration was also tested on the router; failure-triggered kernel-set rollback has not yet been validated on real hardware.
+
+Backups are outside the add-on directory and survive `purge`. They are not automatically pruned. Copy important backups off the router; they can contain private configuration, resolved destination IPs, and cron details.
 
 ## Uninstall
 
@@ -419,6 +548,10 @@ Keep a backup before changing routing on a router you depend on.
 | Legacy migration/removal refused | Unknown backend or hook references require inspection; do not bypass the guard |
 | `install` reports a disabled installation | Use `configure-vpn` to re-enable, or perform a backed-up purge for a clean cycle |
 | Shell reports `getcwd` after purge | Its current directory was deleted; run `cd /tmp` |
+| A newer installer did not update the backend | Ordinary `install` repairs only the WebUI on an existing installation; use `upgrade-backend` |
+| `upgrade-backend` rejects a backend file | The file does not match a supported fingerprint; inspect local modifications instead of bypassing the guard |
+| A DNS answer exists but its IP is missing from the set | Check whether the answer came from cache and whether the set was flushed; cached replies are not guaranteed to restore missing entries |
+| DNS TTL limits are missing after updating | Confirm that `upgrade-backend` completed and that the generated include contains both `max-cache-ttl=3600` and `max-ttl=3600` |
 
 Useful read-only diagnostics:
 
@@ -449,14 +582,18 @@ Also inspect the system log for `vpn-domain`, `vpdomain`, and `dnsmasq` entries.
 
 - DNS routing operates on resolved destination IPs, not the hostname in each connection.
 - Existing client DNS caches may delay the effect of list changes. A domain's additional service/CDN domains may need separate consideration.
-- Changing the generated DNS include clears the old set entries through the postconf integration; new matching lookups repopulate them.
+- Outside the explicit backend-upgrade migration, a generated-configuration hash change still causes the postconf integration to flush the destination set. Version 3.0.3 does not implement per-domain IP ownership or selective removal.
+- After a set flush, fresh matching external DNS responses can repopulate it. Client-side cached addresses and cached dnsmasq replies can leave entries missing temporarily; the longer timeout does not prevent an explicit flush.
+- The backend-upgrade migration handles its expected DNS-include change specially to preserve the migrated IP entries.
+- DNS cache and client TTL limits apply to the main dnsmasq instance that loads the generated include. Separate dnsmasq instances are not automatically changed.
+- Version 3.0.3 does not guarantee synchronous ipset updates for every cached DNS response. Its mitigation is to keep learned IPs longer than the configured DNS cache and client TTL limits.
 - The page's command channel writes small updates to `custom_settings.txt` on JFFS. Opening the page only reads published state; explicit Reload and Save operations use the settings channel.
 - The installer and boot hooks include readiness waits, but boot recovery still needs validation on your own model and firmware. A successful live install does not prove every boot-order scenario.
 - This add-on changes DNS integration, firewall marking, and policy routing. It is not a zero-impact WebUI-only extension.
 
 ## Disclaimer
 
-This software is provided as is, without warranty. It edits shared router hooks and changes DNS integration and IPv4 routing. Installation, migration, re-enable, and removal can interrupt connectivity and restart dnsmasq.
+This software is provided as is, without warranty. It edits shared router hooks and changes DNS integration and IPv4 routing. Installation, backend upgrades, migration, re-enable, and removal can interrupt connectivity and restart dnsmasq.
 
 Test on a non-critical setup first, keep backups outside the router, and retain a working SSH access path. Automatic backups and best-effort rollback do not guarantee recovery from every failure.
 
